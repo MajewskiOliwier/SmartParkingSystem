@@ -39,3 +39,10 @@
 
 # debug information files
 *.dwo
+
+.build
+.mbed
+projectfiles
+*.py*
+mbed-os
+BUILD
