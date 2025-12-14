@@ -1,10 +1,13 @@
 /*
  * SMART PARKING SYSTEM - Single File Complete Solution
+ *
  * Features:
- * - Asynchronous Ultrasonic Sensor Reading (Interrupt based)
- * - Nearest Neighbor Blinking Logic (Lookup Table)
- * - BLE Control via nRF Connect (System ON/OFF, Blink ON/OFF)
- * - Auto-Reset Timeout (Anti-Ghosting)
+ * - Asynchronous ultrasonic distance measurement (interrupt-based)
+ * - Distance-dependent blinking logic (nearest-neighbor lookup table)
+ * - BLE control via nRF Connect (system ON/OFF, blinking ON/OFF)
+ * - Measurement timeout (anti-ghosting mechanism)
+ *
+ * Target platform: Mbed OS + BLE
  */
 
 #include "mbed.h"
@@ -20,106 +23,190 @@ using mbed::callback;
 using namespace std::literals::chrono_literals;
 
 // =================================================================================
-// 1. PARKING CONTROLLER (HARDWARE LOGIC)
+// DATA STRUCTURES
 // =================================================================================
 
-// Configuration Structure: Distance -> Blinking Rate
+/*
+ * Blink configuration entry.
+ * Each entry represents a reference distance and the corresponding
+ * blinking speed (expressed in scheduler ticks).
+ */
 struct BlinkConfig {
-    int standard_distance_cm; // Reference distance
-    int wait_ticks;           // Blinking speed (0=Solid ON, -1=OFF)
+    int standard_distance_cm; // Reference distance (center of a distance zone)
+    int wait_ticks;           // Blinking rate: 0 = solid ON, -1 = OFF
 };
 
-class ParkingController {
+/*
+ * Shared system state for a single parking space.
+ * This structure acts as a central context and is shared
+ * between all system components via references.
+ */
+struct ParkSpaceConfig {
+    bool system_active = true;   // Master enable/disable flag (set via BLE)
+    bool blink_enabled = true;   // Enable/disable blinking LED (set via BLE)
 
+    int  distance_cm = 400;      // Last measured distance (cm)
+    bool occupied = false;       // Parking space occupancy state
+
+    int blink_ticks = -1;        // Current blinking mode
+};
+
+// =================================================================================
+// ULTRASONIC SENSOR (HARDWARE ABSTRACTION)
+// =================================================================================
+
+/*
+ * UltrasonicSensor
+ *
+ * Handles low-level ultrasonic distance measurement using:
+ * - Trigger pin (output)
+ * - Echo pin (interrupt input)
+ *
+ * Measurement is fully asynchronous and interrupt-driven.
+ */
+class UltrasonicSensor {
 public:
-    // Constructor
-    ParkingController(PinName trigPin, PinName echoPin, PinName ledBlinkPin, PinName ledStatusPin) :
-        _trig(trigPin),
-        _echo(echoPin),
-        _ledBlink(ledBlinkPin),   
-        _ledStatus(ledStatusPin), 
-        _timer()
+    UltrasonicSensor(PinName trig, PinName echo)
+        : _trig(trig), _echo(echo)
     {
-        // Sensor Interrupt Setup (Asynchronous reading)
-        _echo.rise(callback(this, &ParkingController::onEchoRise));
-        _echo.fall(callback(this, &ParkingController::onEchoFall));
-        
-        // Start Timer and set initial state
+        // Register interrupt handlers for echo signal
+        _echo.rise(callback(this, &UltrasonicSensor::onRise));
+        _echo.fall(callback(this, &UltrasonicSensor::onFall));
+
+        // Start internal timer used for pulse width measurement
         _timer.start();
-        _ledBlink = 0;
-        _ledStatus = 0;
-        
-        last_valid_reading_time = _timer.elapsed_time().count();
     }
 
-    // --- VARIABLES CONTROLLABLE VIA BLE ---
-    bool is_system_active = true;   // Master Switch (Everything OFF/ON)
-    bool is_blink_enabled = true;   // Controls only the blinking LED
+    /*
+     * Sends a 10 µs trigger pulse to start a measurement.
+     * Called periodically from the EventQueue.
+     */
+    void trigger() {
+        _trig = 1;
+        wait_us(10);
+        _trig = 0;
+    }
 
-    // --- READING VARIABLE ---
-    volatile int current_distance_cm = 400; // Default: Far away
+    /*
+     * Returns true if a valid measurement has been received
+     * within the specified timeout window.
+     */
+    bool hasFreshReading(uint64_t now_us) const {
+        return (now_us - _last_valid_time) < 200000; // 200 ms timeout
+    }
 
-    // --- MAIN LOOP (to be called every 100ms) ---
-    void update_loop() {
-        
-        // 1. If turned off via BLE, reset everything and exit
-        if (!is_system_active) {
-            _ledBlink = 0;
-            _ledStatus = 0;
-            return;
-        }
-
-        // 2. Timeout Check (Anti-Ghosting)
-        // If we haven't heard an echo for 200ms, reset distance to "Far"
-        uint64_t now = _timer.elapsed_time().count();
-        if ((now - last_valid_reading_time) > 200000) { 
-            current_distance_cm = 400; 
-        }
-
-        // 3. Trigger Sensor
-        trigger_sensor();
-
-        // 4. Status LED Management (e.g., Green/Red on Display)
-        if (current_distance_cm > 0 && current_distance_cm < 200) {
-            _ledStatus = 1; // Car present
-        } else {
-            _ledStatus = 0; // Free
-        }
-
-        // 5. Blinking LED Management (Nearest Neighbor)
-        if (is_blink_enabled) {
-            int best_ticks = get_ticks_for_closest_distance(current_distance_cm);
-            apply_blinking_logic(best_ticks);
-        } else {
-            _ledBlink = 0;
-        }
+    /*
+     * Returns the last measured distance in centimeters.
+     */
+    int getDistanceCm() const {
+        return _distance_cm;
     }
 
 private:
-    DigitalOut _trig;
-    InterruptIn _echo;
-    DigitalOut _ledBlink; 
-    DigitalOut _ledStatus;
-    Timer _timer;
+    DigitalOut   _trig;   // Trigger output pin
+    InterruptIn _echo;    // Echo input pin (interrupt-driven)
+    Timer       _timer;  // Timer for pulse width measurement
 
-    volatile uint64_t start_time = 0;
-    volatile uint64_t last_valid_reading_time = 0; 
-    int blink_counter = 0;
+    volatile uint64_t _start_time = 0;       // Echo pulse start time
+    volatile uint64_t _last_valid_time = 0;  // Timestamp of last valid measurement
+    volatile int      _distance_cm = 400;    // Cached distance value
 
-    // ZONE TABLE
-    static const int TABLE_SIZE = 5;
+    /*
+     * Interrupt handler: echo signal rising edge.
+     * Stores the start time of the echo pulse.
+     */
+    void onRise() {
+        _start_time = _timer.elapsed_time().count();
+    }
+
+    /*
+     * Interrupt handler: echo signal falling edge.
+     * Computes pulse duration and converts it to distance.
+     */
+    void onFall() {
+        uint64_t now = _timer.elapsed_time().count();
+        uint64_t dur = now - _start_time;
+        int d = dur / 58; // Conversion from µs to cm
+
+        if (d > 0 && d < 450) {
+            _distance_cm = d;
+            _last_valid_time = now;
+        }
+    }
+};
+
+// =================================================================================
+// PARKING LOGIC (DECISION MAKING)
+// =================================================================================
+
+/*
+ * ParkingLogic
+ *
+ * Implements all decision-making logic:
+ * - occupancy detection
+ * - blinking mode selection
+ *
+ * Does not interact directly with hardware.
+ */
+class ParkingLogic {
+public:
+    ParkingLogic(ParkSpaceConfig& parkingSpaceState)
+        : _parkingSpaceState(parkingSpaceState) {}
+
+    /*
+     * Periodic update function.
+     * Called from the EventQueue at a fixed interval.
+     */
+    void update(uint64_t now_us, const UltrasonicSensor& sensor) {
+
+        // System disabled via BLE -> reset outputs
+        if (!_parkingSpaceState.system_active) {
+            _parkingSpaceState.occupied = false;
+            _parkingSpaceState.blink_ticks = -1;
+            return;
+        }
+
+        // No recent measurement -> assume no object present
+        if (!sensor.hasFreshReading(now_us)) {
+            _parkingSpaceState.distance_cm = 400;
+            _parkingSpaceState.occupied = false;
+            _parkingSpaceState.blink_ticks = -1;
+            return;
+        }
+
+        // Update distance and occupancy state
+        _parkingSpaceState.distance_cm = sensor.getDistanceCm();
+        _parkingSpaceState.occupied =
+            (_parkingSpaceState.distance_cm < 200);
+
+        // Select blinking mode using nearest-neighbor lookup
+        _parkingSpaceState.blink_ticks =
+            get_ticks_for_closest_distance(_parkingSpaceState.distance_cm);
+    }
+
+private:
+    ParkSpaceConfig& _parkingSpaceState;
+
+    // Lookup table for distance-based blinking behavior
+    static const int TABLE_SIZE = 7;
     const BlinkConfig blink_table[TABLE_SIZE] = {
-        {  10,  0 },  // 10cm  -> Solid ON (STOP)
-        {  30,  2 },  // 30cm  -> Fast Blink
-        {  60,  5 },  // 60cm  -> Medium Blink
-        { 100, 10 },  // 100cm -> Slow Blink
-        { 250, -1 }   // 250cm -> OFF
+        {  10,  0 },   // Very close -> solid ON
+        {  30,  2 },   // Fast blink
+        {  60,  5 },   // Medium blink
+        { 100,  8 },
+        { 150, 14 },
+        { 200, 20 },
+        { 250, -1 }    // Far / no object -> OFF
     };
 
-    // Nearest Neighbor Search Algorithm
+    /*
+     * Nearest-neighbor selection algorithm.
+     * Chooses the blinking configuration whose reference distance
+     * is closest to the current measured distance.
+     */
     int get_ticks_for_closest_distance(int real_dist) {
-        int best_ticks = -1; 
-        int min_diff = 9999; 
+        int best_ticks = -1;
+        int min_diff = 9999;
 
         for (int i = 0; i < TABLE_SIZE; i++) {
             int diff = abs(real_dist - blink_table[i].standard_distance_cm);
@@ -130,151 +217,178 @@ private:
         }
         return best_ticks;
     }
-
-    void apply_blinking_logic(int ticks) {
-        if (ticks == -1) { _ledBlink = 0; blink_counter = 0; return; }
-        if (ticks == 0)  { _ledBlink = 1; blink_counter = 0; return; }
-
-        blink_counter++;
-        if (blink_counter >= ticks) {
-            _ledBlink = !_ledBlink;
-            blink_counter = 0;
-        }
-    }
-
-    // Sensor Interrupts
-    void onEchoRise() {
-        start_time = _timer.elapsed_time().count();
-    }
-
-    void onEchoFall() {
-        uint64_t now = _timer.elapsed_time().count();
-        uint64_t duration = now - start_time;
-        int d = (int)(duration / 58);
-        
-        if (d > 0 && d < 450) {
-            current_distance_cm = d;
-            last_valid_reading_time = now; // Reset timeout
-        }
-    }
-
-    void trigger_sensor() {
-        _trig = 1;
-        wait_us(10);
-        _trig = 0;
-    }
 };
 
 // =================================================================================
-// 2. PARKING SERVICE (BLE LOGIC)
+// LED OUTPUT CONTROLLERS
 // =================================================================================
 
-class ParkingService : public ble::GattServer::EventHandler {
+/*
+ * Status LED controller.
+ * Indicates whether the parking space is free or occupied.
+ */
+class StatusLed {
 public:
-    // Randomly generated UUIDs for your custom service
-    const static uint16_t SERVICE_UUID = 0xA000;
-    const static uint16_t CHAR_SYSTEM_UUID = 0xA001;
-    const static uint16_t CHAR_BLINK_UUID  = 0xA002;
+    StatusLed(PinName pin) : _led(pin) {}
 
-    ParkingService(ParkingController& controller) :
-        _controller(controller),
-        _system_char(CHAR_SYSTEM_UUID, 1), // Default 1 (ON)
-        _blink_char(CHAR_BLINK_UUID, 1),   // Default 1 (ON)
-        _parking_service(
-            SERVICE_UUID,
-            _chars,
-            sizeof(_chars) / sizeof(_chars[0])
-        )
-    {
-        _chars[0] = &_system_char;
-        _chars[1] = &_blink_char;
-    }
-
-    void start(BLE &ble, events::EventQueue &event_queue) {
-        _server = &ble.gattServer();
-        _server->addService(_parking_service);
-        _server->setEventHandler(this);
-        
-        printf("Parking Service started.\r\n");
-    }
-
-protected:
-    // Callback when writing from the nRF Connect App
-    void onDataWritten(const GattWriteCallbackParams &params) override {
-        
-        // Case 1: Write on SYSTEM CONTROL (Master Switch)
-        if (params.handle == _system_char.getValueHandle() && params.len == 1) {
-            bool val = params.data[0] != 0;
-            _controller.is_system_active = val;
-            printf("BLE Write: System Active -> %d\r\n", val);
-        }
-        
-        // Case 2: Write on BLINK CONTROL (Only Blinking LED)
-        else if (params.handle == _blink_char.getValueHandle() && params.len == 1) {
-            bool val = params.data[0] != 0;
-            _controller.is_blink_enabled = val;
-            printf("BLE Write: Blink Enabled -> %d\r\n", val);
+    void update(const ParkSpaceConfig& state) {
+        if (!state.system_active) {
+            _led = 0;
+        } else {
+            _led = state.occupied ? 0 : 1; // ON when free
         }
     }
 
 private:
-    ParkingController& _controller; // Reference to hardware controller
-    GattServer *_server = nullptr;
+    DigitalOut _led;
+};
 
-    // Template Helper to define Read/Write characteristics
-    template<typename T>
-    class RWChar : public GattCharacteristic {
-    public:
-        RWChar(const UUID &uuid, const T& initial) :
-            GattCharacteristic(uuid, &_value, sizeof(_value), sizeof(_value),
-                GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_WRITE |
-                GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_READ),
-            _value(initial) {}
-    private:
-        uint8_t _value;
-    };
+/*
+ * Blinking LED controller.
+ * Visualizes the distance to the detected object.
+ */
+class BlinkLed {
+public:
+    BlinkLed(PinName pin) : _led(pin) {}
 
-    RWChar<uint8_t> _system_char;
-    RWChar<uint8_t> _blink_char;
-    GattCharacteristic* _chars[2];
-    GattService _parking_service;
+    void tick(const ParkSpaceConfig& state) {
+
+        // Disabled either globally or via BLE
+        if (!state.system_active || !state.blink_enabled) {
+            _led = 0;
+            _counter = 0;
+            return;
+        }
+
+        if (state.blink_ticks == -1) {
+            _led = 0;
+            _counter = 0;
+        }
+        else if (state.blink_ticks == 0) {
+            _led = 1; // Solid ON
+        }
+        else {
+            _counter++;
+            if (_counter >= state.blink_ticks) {
+                _led = !_led;
+                _counter = 0;
+            }
+        }
+    }
+
+private:
+    DigitalOut _led;
+    int _counter = 0;
 };
 
 // =================================================================================
-// 3. MAIN (SETUP AND CONNECTION)
+// BLE SERVICE (REMOTE CONTROL INTERFACE)
 // =================================================================================
 
-// Define the correct board PINs here
-// Example: Trigger on D10, Echo on D11, Blinking LED on LED1, Status LED on D9
-ParkingController myParking(D10, D11, LED1, D9);
+/*
+ * ParkingBLEService
+ *
+ * Provides BLE characteristics to remotely control:
+ * - system ON/OFF
+ * - blinking LED enable/disable
+ */
+class ParkingBLEService : public ble::GattServer::EventHandler {
+public:
+    static const uint16_t SERVICE_UUID = 0xA000;
+    static const uint16_t CHAR_SYSTEM  = 0xA001;
+    static const uint16_t CHAR_BLINK   = 0xA002;
+
+    ParkingBLEService(ParkSpaceConfig& state)
+        : _state(state),
+          _sys_char(CHAR_SYSTEM, 1),
+          _blink_char(CHAR_BLINK, 1),
+          _service(SERVICE_UUID, _chars, 2)
+    {
+        _chars[0] = &_sys_char;
+        _chars[1] = &_blink_char;
+    }
+
+    void start(BLE& ble) {
+        _server = &ble.gattServer();
+        _server->addService(_service);
+        _server->setEventHandler(this);
+    }
+
+    /*
+     * Callback invoked when a BLE client writes to a characteristic.
+     */
+    void onDataWritten(const GattWriteCallbackParams& p) override {
+        if (p.handle == _sys_char.getValueHandle()) {
+            _state.system_active = (p.data[0] != 0);
+        }
+        else if (p.handle == _blink_char.getValueHandle()) {
+            _state.blink_enabled = (p.data[0] != 0);
+        }
+    }
+
+private:
+    ParkSpaceConfig& _state;
+    GattServer* _server;
+
+    template<typename T>
+    class RWChar : public GattCharacteristic {
+    public:
+        RWChar(uint16_t uuid, T v)
+            : GattCharacteristic(uuid, &_val, sizeof(_val), sizeof(_val),
+                BLE_GATT_CHAR_PROPERTIES_READ |
+                BLE_GATT_CHAR_PROPERTIES_WRITE),
+              _val(v) {}
+    private:
+        uint8_t _val;
+    };
+
+    RWChar<uint8_t> _sys_char;
+    RWChar<uint8_t> _blink_char;
+    GattCharacteristic* _chars[2];
+    GattService _service;
+};
+
+// =================================================================================
+// MAIN APPLICATION ENTRY POINT
+// =================================================================================
 
 int main()
 {
-    mbed_trace_init();
+    // Shared system state
+    ParkSpaceConfig parkingSpaceState;
 
-    BLE &ble = BLE::Instance();
-    events::EventQueue event_queue;
+    BLE& ble = BLE::Instance();
+    events::EventQueue q;
 
-    // BLE Service Instance (passing the controller as reference)
-    ParkingService parking_service_ble(myParking);
+    // Hardware components
+    UltrasonicSensor usSensor(D10, D11);
+    ParkingLogic logic(parkingSpaceState);
+    StatusLed statusLed(D9);
+    BlinkLed blinkLed(LED1);
 
-    // Standard Mbed process to handle connection/advertising
-    GattServerProcess ble_process(event_queue, ble);
+    // BLE service
+    ParkingBLEService bleService(parkingSpaceState);
+    GattServerProcess bleProcess(q, ble);
 
-    ble_process.on_init([&](BLE &ble, events::EventQueue &q) {
-        
-        // 1. Start BLE services
-        parking_service_ble.start(ble, q);
-        
-        // 2. START PARKING LOGIC
-        // The event queue will call "update_loop" every 100 milliseconds
-        // This works regardless of whether Bluetooth is connected or not
-        q.call_every(100ms, callback(&myParking, &ParkingController::update_loop));
+    bleProcess.on_init([&](BLE&, events::EventQueue& q) {
 
-        printf("System started. Waiting for BLE...\r\n");
+        // Start BLE service
+        bleService.start(ble);
+
+        // Main control loop (sensor + logic + status LED)
+        q.call_every(100ms, [&] {
+            usSensor.trigger();
+            uint64_t now = Kernel::get_ms_count() * 1000;
+            logic.update(now, usSensor);
+            statusLed.update(parkingSpaceState);
+        });
+
+        // Fast loop for blinking LED timing
+        q.call_every(20ms, [&] {
+            blinkLed.tick(parkingSpaceState);
+        });
     });
 
-    ble_process.start();
-
+    bleProcess.start();
     return 0;
 }
